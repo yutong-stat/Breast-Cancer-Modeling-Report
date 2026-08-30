@@ -3,16 +3,16 @@ title: "Breast Cancer Diagnosis Classification"
 subtitle: "Wisconsin Diagnostic Breast Cancer data"
 author: "Tong Yu"
 output:
-  pdf_document:
-    toc: false
-    number_sections: false
-    latex_engine: xelatex
   html_document:
     toc: true
     number_sections: false
     toc_float: true
     theme: readable
     df_print: default
+  pdf_document:
+    toc: false
+    number_sections: false
+    latex_engine: xelatex
 ---
 
 ```{r setup, include=FALSE}
@@ -1049,7 +1049,7 @@ In the reduced logistic model, the estimated odds ratio for mean radius is 2.44.
 
 For lasso and elastic net, the nonzero coefficients are the variables kept after penalization. Variables excluded by the penalty are not necessarily medically irrelevant. Several WDBC variables measure almost the same tumor-size or tumor-shape pattern, so the model may keep one representative variable and drop another similar one. The stability-selection table is useful for checking which variables are selected consistently, rather than only in one split.
 
-# Technical Note: Standardization and Penalized Regression
+# Technical Note on Scaling
 
 ## Coefficient conversion
 
@@ -1106,7 +1106,7 @@ SE(\hat\beta_j)=SE\left(\frac{\hat\alpha_j}{s_j}\right)
 \]
 This is why a standardized slope and an original-scale slope can have different numerical values while representing the same fitted linear predictor.
 
-## Why scaling matters for lasso and elastic net
+## Why scaling matters
 
 This is the reason for scaling before PCA and before the penalized logistic models. The WDBC predictors have different units and scales, so standardization keeps variables such as area from dominating only because they are measured on larger numerical scales. The same algebra also shows how a standardized coefficient can be translated back to the original measurement scale.
 
