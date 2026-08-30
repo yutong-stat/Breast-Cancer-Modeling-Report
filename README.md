@@ -14,6 +14,6 @@ Elastic net logistic regression gave the strongest overall performance, with tes
 
 ## File description
 
-- `index.html`: portfolio-style HTML report
+- `index.html`: HTML report
 - `Breast Cancer Modeling Report.pdf`: formal PDF report
 - `Breast Cancer Modeling Report.Rmd`: reproducible R Markdown analysis
