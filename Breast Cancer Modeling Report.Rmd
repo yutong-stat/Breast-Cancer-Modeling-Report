@@ -1,0 +1,1133 @@
+---
+title: "Breast Cancer Diagnosis Classification"
+subtitle: "Wisconsin Diagnostic Breast Cancer data"
+author: "Tong Yu"
+output:
+  pdf_document:
+    toc: false
+    number_sections: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+    theme: readable
+    df_print: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7.2,
+  fig.height = 4.6
+)
+
+required_packages <- c(
+  "tidyverse", "caret", "glmnet", "MASS", "pROC", "broom", "knitr", "kableExtra", "cluster"
+)
+
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# Use explicit dplyr:: prefixes in data-wrangling calls because MASS also has a function named select().
+set.seed(426)
+
+diag_cols <- c("Benign" = "#4E79A7", "Malignant" = "#E15759")
+model_cols <- c(
+  "Reduced logistic" = "#4E79A7",
+  "LDA" = "#59A14F",
+  "Lasso logistic" = "#B07AA1",
+  "Elastic net logistic" = "#76B7B2"
+)
+
+theme_project <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10.5),
+      axis.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.caption = element_text(size = 9, color = "gray35")
+    )
+}
+```
+
+# Overview
+
+This analysis uses the Wisconsin Diagnostic Breast Cancer data to classify tumors as malignant or benign from cell-nucleus measurements. The dataset has 569 observations: 357 benign cases and 212 malignant cases. The models compared are a small logistic regression model, LDA, lasso logistic regression, and elastic net logistic regression. On the holdout test set, elastic net gives the strongest result: accuracy 0.971, sensitivity 0.937, specificity 0.991, and AUC 0.992. Repeated cross-validation is consistent with this result, with mean accuracy 0.972 and mean AUC 0.993 for elastic net. Across the EDA, PCA, and fitted models, the strongest signal comes from tumor size and shape-irregularity measurements.
+
+# Data and Goal
+
+The goal is to predict whether a tumor is malignant or benign using numeric measurements computed from digitized breast-mass images. Malignant cases are coded as \(Y = 1\) and benign cases as \(Y = 0\), so the fitted models estimate \(P(Y = 1 \mid X)\).
+
+The data include an ID variable, the diagnosis label, and 30 numeric predictors. The predictors are summaries of ten cell-nucleus characteristics. For each characteristic, the dataset records the mean, standard error, and worst/largest value. The raw file does not include column headers, so the predictor names used below were assigned from the standard WDBC feature structure, such as mean radius, radius standard error, and worst radius. The ID column is removed before modeling because it is only an identifier.
+
+```{r load-data}
+candidate_files <- c("wdbc.data", "wdbc.csv", "breast-cancer-wisconsin.data")
+data_file <- candidate_files[file.exists(candidate_files)][1]
+if (is.na(data_file)) {
+  stop("Data file not found. Please place wdbc.data in the same folder as this Rmd file.")
+}
+
+base_features <- c(
+  "radius", "texture", "perimeter", "area", "smoothness",
+  "compactness", "concavity", "concave_points", "symmetry", "fractal_dimension"
+)
+
+feature_names <- c(
+  paste0(base_features, "_mean"),
+  paste0(base_features, "_se"),
+  paste0(base_features, "_worst")
+)
+
+wdbc <- read.csv(data_file, header = FALSE)
+colnames(wdbc) <- c("id", "diagnosis", feature_names)
+
+wdbc <- wdbc %>%
+  dplyr::mutate(
+    diagnosis = factor(diagnosis, levels = c("B", "M"), labels = c("Benign", "Malignant")),
+    malignant = ifelse(diagnosis == "Malignant", 1, 0)
+  )
+
+data_overview <- tibble(
+  `Observations` = nrow(wdbc),
+  `Numeric predictors` = length(feature_names),
+  `Response classes` = nlevels(wdbc$diagnosis)
+)
+
+knitr::kable(data_overview, caption = "Dataset overview.")
+```
+
+```{r data-dictionary}
+data_dictionary <- tibble(
+  Variable = c("diagnosis", "malignant", base_features),
+  Meaning = c(
+    "Original class label: benign or malignant",
+    "Binary response used for modeling: 1 = malignant, 0 = benign",
+    "Mean distance from center to points on the perimeter",
+    "Standard deviation of gray-scale values",
+    "Size of the core tumor boundary",
+    "Area of the cell nucleus",
+    "Local variation in radius lengths",
+    "Perimeter squared divided by area minus one",
+    "Severity of concave portions of the contour",
+    "Number/severity of concave portions of the contour",
+    "Symmetry of the cell nucleus",
+    "Coastline approximation of the nucleus boundary"
+  )
+)
+
+knitr::kable(data_dictionary, caption = "Main predictor groups.")
+```
+
+# Data Preparation
+
+The diagnosis label is stored both as a factor for classification and as a 0/1 response for logistic regression. The data contain no missing values, so no imputation was needed. The numeric predictors are standardized for PCA and the penalized models because the measurements are on different scales. In tables, names such as `radius_mean` and `concave_points_worst` refer to the column names assigned during data preparation.
+
+```{r missing-values}
+missing_overview <- tibble(
+  Total_missing_values = sum(is.na(wdbc)),
+  Variables_with_missing_values = sum(colSums(is.na(wdbc)) > 0)
+)
+
+invisible(missing_overview)
+```
+
+```{r preprocessing}
+model_data <- wdbc %>%
+  dplyr::select(-id)
+
+x_all <- model_data %>%
+  dplyr::select(all_of(feature_names))
+
+y_factor <- model_data$diagnosis
+y_binary <- model_data$malignant
+
+class_table <- model_data %>%
+  dplyr::count(diagnosis, name = "Count") %>%
+  dplyr::mutate(Proportion = Count / sum(Count)) %>%
+  dplyr::rename(Diagnosis = diagnosis)
+
+knitr::kable(class_table, digits = 3, caption = "Class balance.")
+```
+
+# Feature Patterns
+
+The plots below give a quick view of the main separation in the data. Malignant cases tend to have larger values on several size and contour-irregularity measurements, although the groups are not perfectly separated by any single variable.
+
+```{r summary-statistics}
+summary_vars <- c(
+  "radius_mean", "texture_mean", "area_mean", "smoothness_mean",
+  "concavity_mean", "concave_points_mean", "radius_worst", "area_worst"
+)
+
+eda_summary <- model_data %>%
+  dplyr::select(diagnosis, all_of(summary_vars)) %>%
+  dplyr::group_by(diagnosis) %>%
+  dplyr::summarise(across(all_of(summary_vars), mean), .groups = "drop") %>%
+  tidyr::pivot_longer(-diagnosis, names_to = "Variable", values_to = "Mean") %>%
+  tidyr::pivot_wider(names_from = diagnosis, values_from = Mean) %>%
+  dplyr::mutate(`Malignant - Benign` = Malignant - Benign)
+
+knitr::kable(
+  eda_summary,
+  digits = 3,
+  caption = "Selected mean values by diagnosis."
+)
+```
+
+```{r eda-plots, fig.cap="Selected predictors by diagnosis."}
+model_data %>%
+  dplyr::select(diagnosis, radius_mean, texture_mean, concavity_mean, concave_points_mean, area_worst) %>%
+  pivot_longer(-diagnosis, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = diagnosis, y = value, fill = diagnosis)) +
+  geom_boxplot(alpha = 0.85, width = 0.72, outlier.alpha = 0.35) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_manual(values = diag_cols) +
+  labs(x = NULL, y = NULL, fill = "Diagnosis") +
+  theme_project() +
+  theme(legend.position = "none")
+```
+
+```{r response-plot, fig.cap="Mean radius and mean concavity by diagnosis."}
+ggplot(model_data, aes(x = radius_mean, y = concavity_mean, color = diagnosis, shape = diagnosis)) +
+  geom_point(alpha = 0.8, size = 2.2) +
+  scale_color_manual(values = diag_cols) +
+  labs(
+    x = "Mean radius",
+    y = "Mean concavity",
+    color = "Diagnosis",
+    shape = "Diagnosis"
+  ) +
+  theme_project()
+```
+
+# Correlated Predictors
+
+Many predictors describe related aspects of the same cell-nucleus geometry. The correlation and VIF results make this structure visible before fitting PCA and penalized logistic models.
+
+```{r correlation-heatmap, fig.width=8, fig.height=6.2, fig.cap="Correlation structure among the most related predictors."}
+corr_mat <- cor(x_all)
+
+mean_abs_cor <- rowMeans(abs(corr_mat - diag(ncol(corr_mat))))
+heatmap_vars <- names(sort(mean_abs_cor, decreasing = TRUE))[1:14]
+heatmap_mat <- corr_mat[heatmap_vars, heatmap_vars]
+heatmap_order <- hclust(as.dist(1 - abs(heatmap_mat)))$order
+heatmap_vars <- colnames(heatmap_mat)[heatmap_order]
+
+short_label <- function(x) {
+  x %>%
+    str_replace_all("concave_points", "concave pts") %>%
+    str_replace_all("fractal_dimension", "fractal dim") %>%
+    str_replace_all("compactness", "compact") %>%
+    str_replace_all("smoothness", "smooth") %>%
+    str_replace_all("perimeter", "perim") %>%
+    str_replace_all("_mean", " mean") %>%
+    str_replace_all("_worst", " worst") %>%
+    str_replace_all("_se", " SE")
+}
+
+corr_df <- as.data.frame(as.table(heatmap_mat[heatmap_vars, heatmap_vars])) %>%
+  dplyr::rename(Variable_1 = Var1, Variable_2 = Var2, Correlation = Freq) %>%
+  dplyr::mutate(
+    i = as.integer(factor(Variable_1, levels = heatmap_vars)),
+    j = as.integer(factor(Variable_2, levels = heatmap_vars))
+  ) %>%
+  dplyr::filter(i >= j) %>%
+  dplyr::mutate(
+    Variable_1 = factor(Variable_1, levels = heatmap_vars, labels = short_label(heatmap_vars)),
+    Variable_2 = factor(Variable_2, levels = heatmap_vars, labels = short_label(heatmap_vars))
+  )
+
+ggplot(corr_df, aes(x = Variable_1, y = Variable_2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.35) +
+  scale_fill_gradient2(limits = c(-1, 1), midpoint = 0, name = "Correlation") +
+  coord_fixed() +
+  labs(x = NULL, y = NULL) +
+  theme_project() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8.5),
+    axis.text.y = element_text(size = 8.5),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+```
+
+```{r high-correlation-pairs}
+high_corr_pairs <- as.data.frame(as.table(corr_mat)) %>%
+  dplyr::rename(Variable_1 = Var1, Variable_2 = Var2, Correlation = Freq) %>%
+  dplyr::filter(as.character(Variable_1) < as.character(Variable_2)) %>%
+  dplyr::mutate(Abs_Correlation = abs(Correlation)) %>%
+  dplyr::arrange(desc(Abs_Correlation)) %>%
+  dplyr::slice(1:10) %>%
+  dplyr::select(Variable_1, Variable_2, Correlation)
+
+high_corr_pairs_display <- high_corr_pairs %>%
+  dplyr::mutate(
+    Variable_1 = short_label(as.character(Variable_1)),
+    Variable_2 = short_label(as.character(Variable_2))
+  ) %>%
+  dplyr::rename(`Variable 1` = Variable_1, `Variable 2` = Variable_2)
+
+knitr::kable(high_corr_pairs_display, digits = 3, caption = "Largest absolute correlations.")
+```
+
+```{r vif-table}
+calc_vif <- function(data, predictors) {
+  purrr::map_dfr(predictors, function(v) {
+    others <- setdiff(predictors, v)
+    form <- as.formula(paste(v, "~", paste(others, collapse = " + ")))
+    fit <- lm(form, data = data)
+    r2 <- summary(fit)$r.squared
+    tibble(Variable = v, VIF = 1 / (1 - r2))
+  })
+}
+
+vif_results <- calc_vif(as.data.frame(x_all), feature_names) %>%
+  dplyr::arrange(desc(VIF))
+
+vif_display <- head(vif_results, 12) %>%
+  dplyr::mutate(Variable = short_label(Variable))
+
+knitr::kable(
+  vif_display,
+  digits = 2,
+  caption = "Highest VIF values."
+)
+```
+
+The strongest pairwise correlations are among size variables: mean radius and mean perimeter have correlation 0.998, mean radius and mean area have correlation 0.987, and worst radius and worst perimeter have correlation 0.994. The VIF values are also very large for the corresponding radius, perimeter, and area variables. This is why individual coefficients from a large unpenalized model should not be treated as stable standalone effects.
+
+
+# Principal Component Analysis
+
+PCA summarizes the 30 numeric predictors without using the diagnosis labels. Since the variables are measured on different scales, PCA is fitted on standardized predictors. The first principal component explains 44.3% of the standardized predictor variance, and the first two components together explain 63.2%.
+
+```{r pca-analysis}
+x_scaled <- scale(x_all)
+pca_fit <- prcomp(x_scaled, center = FALSE, scale. = FALSE)
+
+pve <- (pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+pca_table <- tibble(
+  PC = paste0("PC", seq_along(pve)),
+  PVE = pve,
+  `Cumulative PVE` = cumsum(pve)
+)
+
+knitr::kable(head(pca_table, 10), digits = 3, caption = "Variance explained by the first ten PCs.")
+```
+
+```{r scree-plot, fig.cap="Variance explained by principal component."}
+pca_table %>%
+  dplyr::slice(1:15) %>%
+  ggplot(aes(x = seq_along(PVE), y = PVE)) +
+  geom_line(linewidth = 0.9, color = "#4E79A7") +
+  geom_point(size = 2.3, color = "#E15759") +
+  scale_x_continuous(breaks = 1:15) +
+  labs(x = "Principal component", y = "Variance explained") +
+  theme_project()
+```
+
+```{r pca-score-plot, fig.cap="First two PCA scores, colored by diagnosis."}
+pca_scores <- as_tibble(pca_fit$x[, 1:2]) %>%
+  dplyr::mutate(diagnosis = model_data$diagnosis)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = diagnosis, shape = diagnosis)) +
+  geom_point(alpha = 0.82, size = 2.3) +
+  scale_color_manual(values = diag_cols) +
+  labs(x = "PC1 score", y = "PC2 score", color = "Diagnosis", shape = "Diagnosis") +
+  theme_project()
+```
+
+```{r pca-loadings}
+loading_table <- as_tibble(pca_fit$rotation[, 1:3], rownames = "Variable")
+
+pc1_top <- loading_table %>%
+  dplyr::mutate(Abs_Loading = abs(PC1)) %>%
+  dplyr::arrange(desc(Abs_Loading)) %>%
+  dplyr::slice(1:10) %>%
+  dplyr::select(Variable, PC1, PC2, PC3)
+
+pc2_top <- loading_table %>%
+  dplyr::mutate(Abs_Loading = abs(PC2)) %>%
+  dplyr::arrange(desc(Abs_Loading)) %>%
+  dplyr::slice(1:10) %>%
+  dplyr::select(Variable, PC1, PC2, PC3)
+
+knitr::kable(pc1_top, digits = 3, caption = "Main contributors to PC1.")
+knitr::kable(pc2_top, digits = 3, caption = "Main contributors to PC2.")
+```
+
+```{r pca-loading-plot, fig.cap="Largest loadings for PC1 and PC2."}
+loading_plot_df <- bind_rows(
+  loading_table %>%
+    dplyr::transmute(Variable, Component = "PC1", Loading = PC1, Abs_Loading = abs(PC1)) %>%
+    dplyr::slice_max(Abs_Loading, n = 10),
+  loading_table %>%
+    dplyr::transmute(Variable, Component = "PC2", Loading = PC2, Abs_Loading = abs(PC2)) %>%
+    dplyr::slice_max(Abs_Loading, n = 10)
+) %>%
+  dplyr::mutate(Variable = reorder(Variable, Abs_Loading))
+
+ggplot(loading_plot_df, aes(x = Variable, y = Loading, fill = Component)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Component, scales = "free_y") +
+  labs(x = "Variable", y = "Loading") +
+  theme_project()
+```
+
+PC1 works mainly as a combined size and boundary-irregularity direction. The largest PC1 loadings come from concavity, concave points, compactness, radius, perimeter, and area variables. PC2 is not just a weaker copy of PC1. Its largest loadings include fractal dimension variables, radius, area, compactness_se, and smoothness_se, so it captures a secondary contrast after the main size/irregularity direction is removed. The score plot is useful because PCA did not use the diagnosis labels, but the two diagnosis groups still separate clearly in the first two PCs.
+
+# Models
+
+The supervised models are a small logistic regression baseline, LDA, lasso logistic regression, and elastic net logistic regression. The small logistic model is included for interpretation. Lasso and elastic net are included because the predictors are highly correlated, so a full unpenalized logistic model would not be a good main model here.
+
+```{r train-test-split}
+set.seed(426)
+train_index <- caret::createDataPartition(model_data$diagnosis, p = 0.70, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+train_x <- train_data %>% dplyr::select(all_of(feature_names))
+test_x <- test_data %>% dplyr::select(all_of(feature_names))
+train_y_factor <- train_data$diagnosis
+test_y_factor <- test_data$diagnosis
+train_y_binary <- train_data$malignant
+test_y_binary <- test_data$malignant
+
+split_summary <- tibble(
+  Dataset = c("Training", "Test"),
+  Observations = c(nrow(train_data), nrow(test_data)),
+  Malignant = c(sum(train_data$diagnosis == "Malignant"), sum(test_data$diagnosis == "Malignant")),
+  Benign = c(sum(train_data$diagnosis == "Benign"), sum(test_data$diagnosis == "Benign"))
+)
+
+knitr::kable(split_summary, caption = "Holdout split.")
+```
+
+## Interpretable Logistic Baseline
+
+```{r logistic-model}
+logit_fit <- glm(
+  malignant ~ radius_mean + texture_mean + smoothness_mean + concavity_mean + concave_points_mean,
+  data = train_data,
+  family = binomial
+)
+
+logit_coef <- broom::tidy(logit_fit) %>%
+  dplyr::mutate(odds_ratio = exp(estimate))
+
+logit_prob <- predict(logit_fit, newdata = test_data, type = "response")
+logit_class <- factor(ifelse(logit_prob >= 0.5, "Malignant", "Benign"), levels = c("Benign", "Malignant"))
+```
+
+## Linear Discriminant Analysis
+
+```{r lda-model}
+# LDA is fitted after standardizing predictors using training-set means and standard deviations.
+preproc <- caret::preProcess(train_x, method = c("center", "scale"))
+train_x_scaled <- predict(preproc, train_x)
+test_x_scaled <- predict(preproc, test_x)
+
+lda_train <- bind_cols(diagnosis = train_y_factor, train_x_scaled)
+lda_test <- bind_cols(diagnosis = test_y_factor, test_x_scaled)
+
+lda_fit <- MASS::lda(diagnosis ~ ., data = lda_train)
+lda_pred <- predict(lda_fit, newdata = lda_test)
+lda_class <- lda_pred$class
+lda_prob <- lda_pred$posterior[, "Malignant"]
+
+lda_prior_table <- tibble(
+  Class = names(lda_fit$prior),
+  Prior = as.numeric(lda_fit$prior)
+)
+
+invisible(lda_prior_table)
+```
+
+## Lasso Logistic
+
+```{r lasso-model}
+x_train_mat <- as.matrix(train_x)
+x_test_mat <- as.matrix(test_x)
+
+set.seed(426)
+cv_lasso <- cv.glmnet(
+  x = x_train_mat,
+  y = train_y_binary,
+  family = "binomial",
+  alpha = 1,
+  standardize = TRUE,
+  type.measure = "class",
+  nfolds = 10
+)
+
+best_lambda_min <- cv_lasso$lambda.min
+best_lambda_1se <- cv_lasso$lambda.1se
+
+lambda_table <- tibble(
+  Choice = c("lambda.min", "lambda.1se"),
+  Lambda = c(best_lambda_min, best_lambda_1se)
+)
+
+invisible(lambda_table)
+
+lasso_prob <- as.numeric(predict(cv_lasso, newx = x_test_mat, s = "lambda.1se", type = "response"))
+lasso_class <- factor(ifelse(lasso_prob >= 0.5, "Malignant", "Benign"), levels = c("Benign", "Malignant"))
+
+lasso_coef <- as.matrix(coef(cv_lasso, s = "lambda.1se"))
+lasso_coef_table <- tibble(
+  Variable = rownames(lasso_coef),
+  Coefficient = as.numeric(lasso_coef[, 1])
+) %>%
+  dplyr::filter(Coefficient != 0, Variable != "(Intercept)") %>%
+  dplyr::arrange(desc(abs(Coefficient)))
+
+knitr::kable(lasso_coef_table, digits = 4, caption = "Nonzero lasso coefficients.")
+```
+
+```{r cv-lasso-plot, fig.cap="Cross-validation curve for lasso."}
+lasso_cv_df <- tibble(
+  NegLogLambda = -log(cv_lasso$lambda),
+  Error = cv_lasso$cvm,
+  Lower = cv_lasso$cvm - cv_lasso$cvsd,
+  Upper = cv_lasso$cvm + cv_lasso$cvsd
+)
+
+lasso_marks <- tibble(
+  Choice = c("lambda.min", "lambda.1se"),
+  NegLogLambda = -log(c(best_lambda_min, best_lambda_1se))
+)
+
+ggplot(lasso_cv_df, aes(x = NegLogLambda, y = Error)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0, color = "gray70", linewidth = 0.35) +
+  geom_line(color = "#4E79A7", linewidth = 0.8) +
+  geom_point(color = "#E15759", size = 1.8) +
+  geom_vline(data = lasso_marks, aes(xintercept = NegLogLambda, linetype = Choice), color = "gray30") +
+  scale_linetype_manual(values = c("lambda.min" = "dashed", "lambda.1se" = "dotted")) +
+  labs(
+    x = expression(-log(lambda)),
+    y = "Misclassification error",
+    linetype = NULL
+  ) +
+  theme_project() +
+  theme(legend.position = "top")
+```
+
+## Elastic Net Logistic
+
+```{r elastic-net-model}
+set.seed(426)
+cv_elastic <- cv.glmnet(
+  x = x_train_mat,
+  y = train_y_binary,
+  family = "binomial",
+  alpha = 0.5,
+  standardize = TRUE,
+  type.measure = "class",
+  nfolds = 10
+)
+
+best_elastic_lambda_min <- cv_elastic$lambda.min
+best_elastic_lambda_1se <- cv_elastic$lambda.1se
+
+elastic_lambda_table <- tibble(
+  Choice = c("lambda.min", "lambda.1se"),
+  Lambda = c(best_elastic_lambda_min, best_elastic_lambda_1se)
+)
+
+invisible(elastic_lambda_table)
+
+elastic_prob <- as.numeric(predict(cv_elastic, newx = x_test_mat, s = "lambda.1se", type = "response"))
+elastic_class <- factor(ifelse(elastic_prob >= 0.5, "Malignant", "Benign"), levels = c("Benign", "Malignant"))
+
+elastic_coef <- as.matrix(coef(cv_elastic, s = "lambda.1se"))
+elastic_coef_table <- tibble(
+  Variable = rownames(elastic_coef),
+  Coefficient = as.numeric(elastic_coef[, 1])
+) %>%
+  dplyr::filter(Coefficient != 0, Variable != "(Intercept)") %>%
+  dplyr::arrange(desc(abs(Coefficient)))
+
+knitr::kable(elastic_coef_table, digits = 4, caption = "Nonzero elastic net coefficients.")
+```
+
+```{r cv-elastic-plot, fig.cap="Cross-validation curve for elastic net."}
+elastic_cv_df <- tibble(
+  NegLogLambda = -log(cv_elastic$lambda),
+  Error = cv_elastic$cvm,
+  Lower = cv_elastic$cvm - cv_elastic$cvsd,
+  Upper = cv_elastic$cvm + cv_elastic$cvsd
+)
+
+elastic_marks <- tibble(
+  Choice = c("lambda.min", "lambda.1se"),
+  NegLogLambda = -log(c(best_elastic_lambda_min, best_elastic_lambda_1se))
+)
+
+ggplot(elastic_cv_df, aes(x = NegLogLambda, y = Error)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0, color = "gray70", linewidth = 0.35) +
+  geom_line(color = "#76B7B2", linewidth = 0.8) +
+  geom_point(color = "#E15759", size = 1.8) +
+  geom_vline(data = elastic_marks, aes(xintercept = NegLogLambda, linetype = Choice), color = "gray30") +
+  scale_linetype_manual(values = c("lambda.min" = "dashed", "lambda.1se" = "dotted")) +
+  labs(
+    x = expression(-log(lambda)),
+    y = "Misclassification error",
+    linetype = NULL
+  ) +
+  theme_project() +
+  theme(legend.position = "top")
+```
+
+```{r penalized-coefficient-plot, fig.cap="Variables kept by the penalized logistic models."}
+coef_plot_df <- bind_rows(
+  lasso_coef_table %>%
+    dplyr::filter(Variable != "(Intercept)") %>%
+    dplyr::mutate(Model = "Lasso logistic"),
+  elastic_coef_table %>%
+    dplyr::filter(Variable != "(Intercept)") %>%
+    dplyr::mutate(Model = "Elastic net logistic")
+) %>%
+  dplyr::group_by(Model) %>%
+  dplyr::slice_max(abs(Coefficient), n = 12) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Variable = reorder(Variable, abs(Coefficient)))
+
+ggplot(coef_plot_df, aes(x = Variable, y = Coefficient, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_y") +
+  labs(x = NULL, y = "Coefficient") +
+  theme_project()
+```
+
+
+# Evaluation
+
+The penalized models use 10-fold cross-validation to choose \(\lambda\). The final lasso and elastic net fits use \(\lambda_{1se}\), which gives a simpler model while staying close to the minimum cross-validation error.
+
+## Holdout Test Set
+
+The holdout comparison uses accuracy, test error, sensitivity, specificity, false positives/false negatives, and ROC/AUC. Malignant is treated as the positive class.
+
+```{r evaluation-functions}
+evaluate_model <- function(true_class, pred_class, prob, model_name, tuning_selection) {
+  cm <- caret::confusionMatrix(pred_class, true_class, positive = "Malignant")
+  roc_obj <- pROC::roc(response = true_class, predictor = prob, levels = c("Benign", "Malignant"), quiet = TRUE)
+  tibble(
+    Model = model_name,
+    Tuning_or_Selection = tuning_selection,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Test_Error = 1 - as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    AUC = as.numeric(pROC::auc(roc_obj))
+  )
+}
+
+model_summary <- bind_rows(
+  evaluate_model(test_y_factor, logit_class, logit_prob, "Reduced logistic", "Preselected interpretable predictors"),
+  evaluate_model(test_y_factor, lda_class, lda_prob, "LDA", "No tuning; full standardized predictor set"),
+  evaluate_model(test_y_factor, lasso_class, lasso_prob, "Lasso logistic", "10-fold CV, lambda 1-SE"),
+  evaluate_model(test_y_factor, elastic_class, elastic_prob, "Elastic net logistic", "10-fold CV, alpha = 0.5, lambda 1-SE")
+)
+
+model_summary_display <- model_summary %>%
+  dplyr::rename(
+    `Tuning / selection` = Tuning_or_Selection,
+    `Test error` = Test_Error
+  )
+
+knitr::kable(model_summary_display, digits = 3, caption = "Test-set model comparison.")
+```
+
+On the held-out test set, elastic net logistic regression has the strongest result: accuracy 0.971, sensitivity 0.937, specificity 0.991, and AUC 0.992. Lasso is close behind with accuracy 0.959 and AUC 0.988. The reduced logistic model and LDA are still useful comparisons, but the penalized models fit the correlated predictor structure better.
+
+```{r confusion-matrices}
+confusion_table <- function(true_class, pred_class, model_name) {
+  as.data.frame(table(Predicted = pred_class, Truth = true_class)) %>%
+    dplyr::mutate(Model = model_name) %>%
+    dplyr::select(Model, Predicted, Truth, Count = Freq)
+}
+
+confusion_summary <- bind_rows(
+  confusion_table(test_y_factor, logit_class, "Reduced logistic"),
+  confusion_table(test_y_factor, lda_class, "LDA"),
+  confusion_table(test_y_factor, lasso_class, "Lasso logistic"),
+  confusion_table(test_y_factor, elastic_class, "Elastic net logistic")
+)
+
+error_summary <- confusion_summary %>%
+  dplyr::group_by(Model) %>%
+  dplyr::summarise(
+    False_Positives = sum(Count[Predicted == "Malignant" & Truth == "Benign"]),
+    False_Negatives = sum(Count[Predicted == "Benign" & Truth == "Malignant"]),
+    .groups = "drop"
+  )
+
+error_summary_display <- error_summary %>%
+  dplyr::rename(`False positives` = False_Positives, `False negatives` = False_Negatives)
+
+knitr::kable(error_summary_display, caption = "False positives and false negatives on the test set.")
+```
+
+```{r roc-plot, fig.cap="ROC comparison on the test set."}
+roc_logit <- pROC::roc(test_y_factor, logit_prob, levels = c("Benign", "Malignant"), quiet = TRUE)
+roc_lda <- pROC::roc(test_y_factor, lda_prob, levels = c("Benign", "Malignant"), quiet = TRUE)
+roc_lasso <- pROC::roc(test_y_factor, lasso_prob, levels = c("Benign", "Malignant"), quiet = TRUE)
+roc_elastic <- pROC::roc(test_y_factor, elastic_prob, levels = c("Benign", "Malignant"), quiet = TRUE)
+
+make_roc_df <- function(roc_obj, model_name) {
+  tibble(
+    Model = model_name,
+    False_Positive_Rate = 1 - roc_obj$specificities,
+    True_Positive_Rate = roc_obj$sensitivities
+  ) %>%
+    dplyr::arrange(False_Positive_Rate, True_Positive_Rate)
+}
+
+roc_df <- bind_rows(
+  make_roc_df(roc_logit, "Reduced logistic"),
+  make_roc_df(roc_lda, "LDA"),
+  make_roc_df(roc_lasso, "Lasso logistic"),
+  make_roc_df(roc_elastic, "Elastic net logistic")
+)
+
+ggplot(roc_df, aes(x = False_Positive_Rate, y = True_Positive_Rate, color = Model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray55") +
+  scale_color_manual(values = model_cols) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+  coord_equal() +
+  labs(
+    title = "ROC comparison",
+    x = "False positive rate",
+    y = "True positive rate",
+    color = "Model"
+  ) +
+  theme_project()
+```
+
+## Repeated Cross-Validation
+
+The test set gives a clean holdout comparison, but it is still only one split. Repeated 10-fold cross-validation gives a more stable check of the same model comparison.
+
+```{r repeated-cv, cache=TRUE}
+fit_predict_fold <- function(train_df, valid_df) {
+  fold_train_x <- train_df %>% dplyr::select(all_of(feature_names))
+  fold_valid_x <- valid_df %>% dplyr::select(all_of(feature_names))
+  fold_train_y <- train_df$diagnosis
+  fold_valid_y <- valid_df$diagnosis
+  fold_train_binary <- train_df$malignant
+
+  # Reduced logistic regression.
+  fold_logit <- glm(
+    malignant ~ radius_mean + texture_mean + smoothness_mean + concavity_mean + concave_points_mean,
+    data = train_df,
+    family = binomial
+  )
+  fold_logit_prob <- predict(fold_logit, newdata = valid_df, type = "response")
+
+
+  # LDA with standardization based only on the training fold.
+  fold_preproc <- caret::preProcess(fold_train_x, method = c("center", "scale"))
+  fold_train_scaled <- predict(fold_preproc, fold_train_x)
+  fold_valid_scaled <- predict(fold_preproc, fold_valid_x)
+  fold_lda_train <- bind_cols(diagnosis = fold_train_y, fold_train_scaled)
+  fold_lda_valid <- bind_cols(diagnosis = fold_valid_y, fold_valid_scaled)
+  fold_lda <- MASS::lda(diagnosis ~ ., data = fold_lda_train)
+  fold_lda_pred <- predict(fold_lda, newdata = fold_lda_valid)
+  fold_lda_prob <- fold_lda_pred$posterior[, "Malignant"]
+
+  # Penalized logistic models with nested cross-validation inside the training fold.
+  fold_x_train_mat <- as.matrix(fold_train_x)
+  fold_x_valid_mat <- as.matrix(fold_valid_x)
+
+  fold_lasso <- cv.glmnet(
+    x = fold_x_train_mat,
+    y = fold_train_binary,
+    family = "binomial",
+    alpha = 1,
+    standardize = TRUE,
+    type.measure = "class",
+    nfolds = 10
+  )
+  fold_lasso_prob <- as.numeric(predict(fold_lasso, newx = fold_x_valid_mat, s = "lambda.1se", type = "response"))
+
+  fold_elastic <- cv.glmnet(
+    x = fold_x_train_mat,
+    y = fold_train_binary,
+    family = "binomial",
+    alpha = 0.5,
+    standardize = TRUE,
+    type.measure = "class",
+    nfolds = 10
+  )
+  fold_elastic_prob <- as.numeric(predict(fold_elastic, newx = fold_x_valid_mat, s = "lambda.1se", type = "response"))
+
+  bind_rows(
+    tibble(Model = "Reduced logistic", Probability = fold_logit_prob),
+    tibble(Model = "LDA", Probability = fold_lda_prob),
+    tibble(Model = "Lasso logistic", Probability = fold_lasso_prob),
+    tibble(Model = "Elastic net logistic", Probability = fold_elastic_prob)
+  ) %>%
+    dplyr::mutate(
+      Truth = rep(fold_valid_y, times = 4),
+      Predicted = factor(ifelse(Probability >= 0.5, "Malignant", "Benign"), levels = c("Benign", "Malignant"))
+    )
+}
+
+set.seed(426)
+n_repeats <- 5
+k_folds <- 10
+cv_predictions <- purrr::map_dfr(seq_len(n_repeats), function(rep_id) {
+  folds <- caret::createFolds(model_data$diagnosis, k = k_folds, returnTrain = FALSE)
+  purrr::imap_dfr(folds, function(valid_index, fold_id) {
+    train_df <- model_data[-valid_index, ]
+    valid_df <- model_data[valid_index, ]
+    fit_predict_fold(train_df, valid_df) %>%
+      dplyr::mutate(Repeat = rep_id, Fold = as.character(fold_id))
+  })
+})
+
+cv_fold_metrics <- cv_predictions %>%
+  dplyr::group_by(Model, Repeat, Fold) %>%
+  dplyr::summarise(
+    Accuracy = mean(Predicted == Truth),
+    Sensitivity = sum(Predicted == "Malignant" & Truth == "Malignant") / sum(Truth == "Malignant"),
+    Specificity = sum(Predicted == "Benign" & Truth == "Benign") / sum(Truth == "Benign"),
+    AUC = as.numeric(pROC::auc(pROC::roc(Truth, Probability, levels = c("Benign", "Malignant"), quiet = TRUE))),
+    .groups = "drop"
+  )
+
+cv_summary <- cv_fold_metrics %>%
+  dplyr::group_by(Model) %>%
+  dplyr::summarise(
+    Accuracy_Mean = mean(Accuracy, na.rm = TRUE),
+    Accuracy_SD = sd(Accuracy, na.rm = TRUE),
+    Sensitivity_Mean = mean(Sensitivity, na.rm = TRUE),
+    Specificity_Mean = mean(Specificity, na.rm = TRUE),
+    AUC_Mean = mean(AUC, na.rm = TRUE),
+    AUC_SD = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(AUC_Mean), desc(Accuracy_Mean))
+
+cv_summary_display <- cv_summary %>%
+  dplyr::rename(
+    `Accuracy mean` = Accuracy_Mean,
+    `Accuracy SD` = Accuracy_SD,
+    `Sensitivity mean` = Sensitivity_Mean,
+    `Specificity mean` = Specificity_Mean,
+    `AUC mean` = AUC_Mean,
+    `AUC SD` = AUC_SD
+  )
+
+knitr::kable(cv_summary_display, digits = 3, caption = "Repeated cross-validation summary.")
+```
+
+The repeated cross-validation results are close to the test-set results. Elastic net has mean accuracy 0.972 and mean AUC 0.993. Lasso has mean accuracy 0.969 and mean AUC 0.993. The main point is not that one model completely dominates the others, but that the penalized logistic models stay strong across repeated splits.
+
+```{r repeated-cv-plot, fig.cap="AUC distribution across repeated CV folds."}
+ggplot(cv_fold_metrics, aes(x = Model, y = AUC, fill = Model)) +
+  geom_boxplot(alpha = 0.85, outlier.alpha = 0.35, show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = model_cols) +
+  labs(x = NULL, y = "Fold-level AUC") +
+  theme_project()
+```
+
+## Probability Calibration
+
+Accuracy and AUC measure separation. Calibration checks a different issue: whether predicted probabilities behave like probabilities. In the test set, elastic net has the smallest Brier score, 0.0294, followed closely by lasso at 0.0298.
+
+```{r calibration-analysis, fig.cap="Calibration of predicted malignant probabilities."}
+probability_df <- bind_rows(
+  tibble(Model = "Reduced logistic", Probability = logit_prob),
+  tibble(Model = "LDA", Probability = lda_prob),
+  tibble(Model = "Lasso logistic", Probability = lasso_prob),
+  tibble(Model = "Elastic net logistic", Probability = elastic_prob)
+) %>%
+  dplyr::mutate(
+    Truth_Class = rep(test_y_factor, times = 4),
+    Truth = ifelse(Truth_Class == "Malignant", 1, 0)
+  )
+
+brier_table <- probability_df %>%
+  dplyr::group_by(Model) %>%
+  dplyr::summarise(Brier_Score = mean((Probability - Truth)^2), .groups = "drop") %>%
+  dplyr::arrange(Brier_Score)
+
+brier_display <- brier_table %>%
+  dplyr::rename(`Brier score` = Brier_Score)
+
+knitr::kable(brier_display, digits = 4, caption = "Brier scores. Smaller values are better.")
+
+calibration_df <- probability_df %>%
+  dplyr::group_by(Model) %>%
+  dplyr::mutate(Bin = dplyr::ntile(Probability, 10)) %>%
+  dplyr::group_by(Model, Bin) %>%
+  dplyr::summarise(
+    Mean_Predicted_Probability = mean(Probability),
+    Observed_Malignant_Rate = mean(Truth),
+    Count = dplyr::n(),
+    .groups = "drop"
+  )
+
+ggplot(calibration_df, aes(x = Mean_Predicted_Probability, y = Observed_Malignant_Rate, color = Model)) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray55") +
+  scale_color_manual(values = model_cols) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Mean predicted malignant probability",
+    y = "Observed malignant rate",
+    color = "Model"
+  ) +
+  theme_project()
+```
+
+## Threshold Choice
+
+The 0.5 cutoff is not automatically the best choice. Since false negatives mean malignant cases predicted as benign, sensitivity and specificity are compared across several cutoffs. For lasso, lowering the threshold from 0.5 to 0.4 reduces false negatives from 5 to 1, while false positives increase from 2 to 3. For elastic net, the same threshold change reduces false negatives from 4 to 2, while false positives increase from 1 to 3.
+
+```{r threshold-analysis}
+threshold_grid <- seq(0.10, 0.90, by = 0.05)
+
+threshold_metrics <- function(true_class, prob, model_name, thresholds) {
+  purrr::map_dfr(thresholds, function(th) {
+    pred_class <- factor(ifelse(prob >= th, "Malignant", "Benign"), levels = c("Benign", "Malignant"))
+    cm <- caret::confusionMatrix(pred_class, true_class, positive = "Malignant")
+    tibble(
+      Model = model_name,
+      Threshold = th,
+      Accuracy = as.numeric(cm$overall["Accuracy"]),
+      Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+      Specificity = as.numeric(cm$byClass["Specificity"]),
+      Precision = as.numeric(cm$byClass["Precision"]),
+      F1 = as.numeric(cm$byClass["F1"]),
+      False_Negatives = cm$table["Benign", "Malignant"],
+      False_Positives = cm$table["Malignant", "Benign"]
+    )
+  })
+}
+
+threshold_results <- bind_rows(
+  threshold_metrics(test_y_factor, lasso_prob, "Lasso logistic", threshold_grid),
+  threshold_metrics(test_y_factor, elastic_prob, "Elastic net logistic", threshold_grid)
+)
+
+threshold_summary <- threshold_results %>%
+  dplyr::filter(Threshold %in% c(0.30, 0.40, 0.50, 0.60, 0.70))
+
+threshold_display <- threshold_summary %>%
+  dplyr::rename(`False negatives` = False_Negatives, `False positives` = False_Positives)
+
+knitr::kable(threshold_display, digits = 3, caption = "Threshold comparison for penalized models.")
+```
+
+```{r threshold-plot, fig.cap="Sensitivity and specificity across thresholds."}
+threshold_plot_df <- threshold_results %>%
+  dplyr::select(Model, Threshold, Sensitivity, Specificity) %>%
+  pivot_longer(c(Sensitivity, Specificity), names_to = "Metric", values_to = "Value")
+
+ggplot(threshold_plot_df, aes(x = Threshold, y = Value, color = Metric, linetype = Metric)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ Model) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Threshold for malignant prediction", y = NULL, color = "Metric", linetype = "Metric") +
+  theme_project()
+```
+
+## Variable Selection Stability
+
+With correlated predictors, lasso and elastic net may not keep exactly the same variables every time. To check this, the penalized models were refit on 100 bootstrap samples and the selection frequency of each variable was recorded.
+
+```{r stability-selection, cache=TRUE}
+set.seed(426)
+B_stability <- 100
+
+get_selected_vars <- function(x_mat, y_vec, alpha_value, lambda_value) {
+  fit <- glmnet(
+    x = x_mat,
+    y = y_vec,
+    family = "binomial",
+    alpha = alpha_value,
+    lambda = lambda_value,
+    standardize = TRUE
+  )
+  coef_vec <- as.matrix(coef(fit))[, 1]
+  names(coef_vec)[coef_vec != 0 & names(coef_vec) != "(Intercept)"]
+}
+
+stability_results <- purrr::map_dfr(seq_len(B_stability), function(b) {
+  boot_index <- sample(seq_len(nrow(train_x)), replace = TRUE)
+  boot_x <- as.matrix(train_x[boot_index, ])
+  boot_y <- train_y_binary[boot_index]
+
+  lasso_selected <- get_selected_vars(boot_x, boot_y, alpha_value = 1, lambda_value = best_lambda_1se)
+  elastic_selected <- get_selected_vars(boot_x, boot_y, alpha_value = 0.5, lambda_value = best_elastic_lambda_1se)
+
+  bind_rows(
+    tibble(Model = "Lasso logistic", Variable = lasso_selected),
+    tibble(Model = "Elastic net logistic", Variable = elastic_selected)
+  )
+})
+
+stability_table <- stability_results %>%
+  dplyr::count(Model, Variable, name = "Times_Selected") %>%
+  dplyr::mutate(Selection_Frequency = Times_Selected / B_stability) %>%
+  dplyr::arrange(Model, desc(Selection_Frequency))
+
+stability_display <- stability_table %>%
+  dplyr::group_by(Model) %>%
+  dplyr::slice_max(Selection_Frequency, n = 8) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(`Times selected` = Times_Selected, `Selection frequency` = Selection_Frequency)
+
+knitr::kable(
+  stability_display,
+  digits = 3,
+  caption = "Most consistently selected variables."
+)
+```
+
+```{r stability-plot, fig.cap="Selection frequencies from bootstrap refits."}
+stability_plot_df <- stability_table %>%
+  dplyr::group_by(Model) %>%
+  dplyr::slice_max(Selection_Frequency, n = 12) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Variable = reorder(Variable, Selection_Frequency))
+
+ggplot(stability_plot_df, aes(x = Variable, y = Selection_Frequency, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_y") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = NULL, y = "Selection frequency") +
+  theme_project()
+```
+
+The holdout and repeated-CV results both favor the penalized logistic models. Elastic net has the best holdout accuracy, 0.971, and the highest test AUC, 0.992. In repeated cross-validation, elastic net and lasso have almost the same mean AUC, about 0.993, while elastic net has a slightly higher mean accuracy. The threshold table shows the practical tradeoff: lowering the cutoff can reduce missed malignant cases, but it also creates more false positives.
+
+# Interpretation
+
+The reduced logistic model is the easiest model to explain with odds ratios. A positive coefficient means that, after holding the other included predictors fixed, larger values of that predictor are associated with higher estimated odds of malignancy. A negative coefficient points in the opposite direction. Because several WDBC measurements are strongly related to each other, these coefficient interpretations should be read as model-based associations rather than isolated biological effects.
+
+```{r interpretation-table}
+interpret_table <- logit_coef %>%
+  dplyr::filter(term %in% c("radius_mean", "texture_mean")) %>%
+  dplyr::transmute(
+    Predictor = c("Mean radius", "Mean texture"),
+    Estimate = round(estimate, 4),
+    `Std. error` = round(std.error, 4),
+    `p-value` = dplyr::case_when(
+      p.value < 0.001 ~ "<0.001",
+      TRUE ~ formatC(p.value, format = "f", digits = 3)
+    ),
+    `Odds ratio` = round(odds_ratio, 4)
+  )
+
+knitr::kable(interpret_table, caption = "Odds ratios for directly interpretable predictors.")
+```
+
+In the reduced logistic model, the estimated odds ratio for mean radius is 2.44. Holding the other listed predictors fixed, a one-unit increase in mean radius is associated with higher estimated odds of malignancy. The estimated odds ratio for mean texture is 1.37, so larger texture values are also associated with higher estimated odds of malignancy after adjusting for the other included predictors. These two variables are easier to discuss because they have direct measurement meanings; many of the shape variables are much harder to separate from each other.
+
+For lasso and elastic net, the nonzero coefficients are the variables kept after penalization. Variables excluded by the penalty are not necessarily medically irrelevant. Several WDBC variables measure almost the same tumor-size or tumor-shape pattern, so the model may keep one representative variable and drop another similar one. The stability-selection table is useful for checking which variables are selected consistently, rather than only in one split.
+
+# Technical Note: Standardization and Penalized Regression
+
+## Coefficient conversion
+
+For a linear predictor using standardized predictors, let
+\[
+z_j = \frac{x_j - \bar{x}_j}{s_j}.
+\]
+If a model is fitted using standardized predictors as
+\[
+\eta = \alpha_0 + \sum_{j=1}^p \alpha_j z_j,
+\]
+then the same linear predictor can be written on the original predictor scale as
+\[
+\eta = \beta_0 + \sum_{j=1}^p \beta_j x_j,
+\]
+where
+\[
+\beta_j = \frac{\alpha_j}{s_j}, \qquad
+\beta_0 = \alpha_0 - \sum_{j=1}^p \frac{\alpha_j \bar{x}_j}{s_j}.
+\]
+For a slope coefficient, the corresponding standard error on the original predictor scale is
+\[
+SE(\hat\beta_j)=\frac{SE(\hat\alpha_j)}{s_j}.
+\]
+
+## Scope of the conversion
+
+The conversion assumes that the same sample means \(\bar{x}_j\) and standard deviations \(s_j\) used to standardize the predictors are known and fixed for the fitted model. The model must include an intercept. The algebra applies to any method whose model uses a linear predictor, including ordinary linear regression and logistic regression. For penalized regression, the penalty affects how \(\alpha_j\) is estimated, but the conversion from standardized to original units follows the same algebra after the model is fitted.
+
+## Algebra
+
+Start with the standardized linear predictor
+\[
+\eta = \alpha_0 + \sum_{j=1}^p \alpha_j \left(\frac{x_j - \bar{x}_j}{s_j}\right).
+\]
+Distribute each coefficient across the numerator:
+\[
+\eta = \alpha_0 + \sum_{j=1}^p \frac{\alpha_j}{s_j}x_j - \sum_{j=1}^p \frac{\alpha_j\bar{x}_j}{s_j}.
+\]
+Collect the terms multiplying \(x_j\) and the terms that do not depend on \(x_j\). This gives
+\[
+\eta = \left(\alpha_0 - \sum_{j=1}^p \frac{\alpha_j\bar{x}_j}{s_j}\right)
++ \sum_{j=1}^p \left(\frac{\alpha_j}{s_j}\right)x_j.
+\]
+Therefore,
+\[
+\beta_j = \frac{\alpha_j}{s_j}, \qquad
+\beta_0 = \alpha_0 - \sum_{j=1}^p \frac{\alpha_j\bar{x}_j}{s_j}.
+\]
+The same scale factor applies to the slope standard error because dividing a random estimate by a constant divides its standard deviation by the absolute value of that constant. Since each sample standard deviation satisfies \(s_j>0\),
+\[
+SE(\hat\beta_j)=SE\left(\frac{\hat\alpha_j}{s_j}\right)
+=\frac{SE(\hat\alpha_j)}{s_j}.
+\]
+This is why a standardized slope and an original-scale slope can have different numerical values while representing the same fitted linear predictor.
+
+## Why scaling matters for lasso and elastic net
+
+This is the reason for scaling before PCA and before the penalized logistic models. The WDBC predictors have different units and scales, so standardization keeps variables such as area from dominating only because they are measured on larger numerical scales. The same algebra also shows how a standardized coefficient can be translated back to the original measurement scale.
+
+This point matters more for penalized regression than for an ordinary fitted logistic model. The lasso penalty has the form
+\[
+\lambda \sum_{j=1}^p |\alpha_j|,
+\]
+so it penalizes the coefficient sizes directly. If two predictors are on very different scales, their coefficients are not directly comparable. A variable measured in large units can have a small coefficient, while a variable measured in small units may need a larger coefficient for a similar change in the linear predictor. Without standardization, the penalty can therefore treat variables differently because of their units, not only because of their predictive value.
+
+Another issue is correlation. In WDBC, variables such as radius, perimeter, area, concavity, and concave points overlap a lot. Lasso may choose one variable from a correlated group and drop the others. Elastic net is included for this reason: the added \(L_2\) part can make the fit less sensitive to which member of a correlated group is selected.
+
+# Limitations
+
+The dataset is small, clean, and widely used, so the performance here may be better than what would be expected on a more heterogeneous clinical dataset. The predictors are also strongly correlated, which makes it difficult to interpret one coefficient at a time even after using regularization. Finally, this analysis does not include an external validation set. For that reason, the results are best read as evidence that the WDBC measurements are highly predictive in this dataset, not as a model that is ready to be used for diagnosis.
+
+# Conclusion
+
+The WDBC predictors separate malignant and benign tumors well in this analysis. Elastic net logistic regression has the best holdout result, with accuracy 0.971 and AUC 0.992. Lasso is close and gives a smaller selected set of variables. The reduced logistic model is still useful because its coefficients can be discussed with odds ratios. PCA supports the same conclusion: much of the variation in the predictors is tied to size and shape features, and those features are also the ones that help separate the diagnosis groups.
+
+
+
+# Data Source
+
+The dataset is the Wisconsin Diagnostic Breast Cancer data from the UCI Machine Learning Repository. The main modeling references are James, Witten, Hastie, and Tibshirani (2021) for statistical learning background and Friedman, Hastie, and Tibshirani (2010) for regularized generalized linear models in `glmnet`.
