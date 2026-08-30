@@ -2,13 +2,12 @@
 
 Statistical learning analysis of the Wisconsin Diagnostic Breast Cancer dataset using logistic regression, PCA, lasso logistic regression, and elastic net logistic regression.
 
-## Project report
+## Report
 
-[View the HTML report](https://yutong-stat.github.io/Breast-Cancer-Modeling-Report/)
+[Read the full PDF report](Breast%20Cancer%20Modeling%20Report.pdf)
 
 ## Files
 
-- `index.html`: portfolio-style project report
 - `Breast Cancer Modeling Report.pdf`: formal report
 - `Breast Cancer Modeling Report.Rmd`: reproducible R Markdown analysis
 
